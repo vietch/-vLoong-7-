@@ -1,0 +1,176 @@
+! unzip data/data168245/Train.zip
+! unzip data/data168245/Test_A.zip
+ 
+
+# 将数据写入txt
+import os
+with open('train.txt','w') as f:
+    for item in os.listdir('Train'):
+        if '.pkl' in item:
+            f.write('Train/'+item+'\n')
+with open('test_A.txt','w') as f:
+    for item in os.listdir('Test_A'):
+        if '.pkl' in item:
+            f.write('Test_A/'+item+'\n')
+
+import pickle
+with open('Train/10034.pkl', 'rb') as f:
+    pkl_data = pickle.load(f)
+    
+pkl_data
+
+# 在这里我们对数据集进行调优，不运行也是可以
+import os
+fp = open('train_positive.txt','w')
+fn = open('train_negative.txt','w')
+for item in os.listdir('Train'):
+    if '.pkl' in item:
+        with open('Train/'+item, 'rb') as fr:
+            pkl_data = pickle.load(fr)
+            label = pkl_data[1]['label']
+            if label == '10':
+                fp.write('Train/'+item+'\n')
+            else:
+                fn.write('Train/'+item+'\n')
+fp.close()
+fn.close()
+
+
+with open('train.txt','w') as fw:
+    with open('train_positive.txt','r') as f:
+        for item in f.readlines():
+            for i in range(10):
+                fw.write(item)
+    with open('train_negative.txt','r') as f:
+        for item in f.readlines():
+                fw.write(item)
+
+import paddle
+import pickle
+
+class MyDateset(paddle.io.Dataset):
+    def __init__(self,txt_dir = 'train.txt', mode = 'train'):
+        super(MyDateset, self).__init__()
+
+        self.mode = mode
+        with open(txt_dir,'r') as f:
+            self.file_list = f.readlines()
+
+    def __getitem__(self, index):
+        file_dir = self.file_list[index][:-1]
+
+        with open(file_dir, 'rb') as f:
+            pkl_data = pickle.load(f)
+
+        data = paddle.to_tensor(pkl_data[0]).astype('float32')
+        data = paddle.transpose(data/4096, [1, 0])
+
+        if self.mode == 'train':
+            label = pkl_data[1]['label']
+            if label == '10':
+                label = 1
+            else:
+                label = 0
+            # label = paddle.to_tensor(label).astype('int64')
+            label = paddle.to_tensor(label).astype('float32')
+        else:
+            label = file_dir.split('/')[1]
+
+        return data,label
+
+    def __len__(self):
+        return len(self.file_list)
+
+if 1:
+    train_dataset=MyDateset('train.txt')
+
+    train_dataloader = paddle.io.DataLoader(
+        train_dataset,
+        batch_size=16,
+        shuffle=True,
+        drop_last=False)
+
+    for step, data in enumerate(train_dataloader):
+        data, label = data
+        print(step, data.shape, label.shape)
+        break
+0 [16, 8, 256] [16, 1]
+In [6]
+class MyNet(paddle.nn.Layer):
+    def __init__(self):
+        super(MyNet,self).__init__()
+        self.fc1 = paddle.nn.Linear(in_features=8*256, out_features=128)
+        self.fc2 = paddle.nn.Linear(in_features=128, out_features=1)
+        # self.m = paddle.nn.Softmax()
+        self.m = paddle.nn.Sigmoid()
+
+    def forward(self,x):
+        x = paddle.flatten(x,start_axis = 1)
+        x = self.fc1(x)
+        x = self.fc2(x)
+        x = self.m(x)
+        return x
+
+if 1:
+    paddle.summary(MyNet(),(16, 8, 256))
+
+# 创建训练模型
+model = MyNet()
+if 1:
+    try:
+        param_dict = paddle.load('model.pdparams')
+        model.load_dict(param_dict)
+    except:
+        print('no such pdparams')
+model.train()
+
+
+max_epoch=10
+scheduler = paddle.optimizer.lr.CosineAnnealingDecay(learning_rate=0.0001, T_max=max_epoch)
+opt = paddle.optimizer.Adam(learning_rate=scheduler, parameters=model.parameters())
+
+# 创建数据集
+train_dataset=MyDateset('train.txt')
+train_dataloader = paddle.io.DataLoader(
+    train_dataset,
+    batch_size=512,
+    shuffle=True,
+    drop_last=False)
+
+now_step=10
+for epoch in range(max_epoch):
+    for step, data in enumerate(train_dataloader):
+        now_step+=1
+
+        data, label = data
+        pre = model(data)
+        # loss = paddle.nn.functional.cross_entropy(pre,label)
+        loss = paddle.nn.functional.mse_loss(pre,label).mean()
+        loss.backward()
+        opt.step()
+        opt.clear_gradients()
+        if now_step%100==0:
+            print("epoch: {}, batch: {}, loss is: {}".format(epoch, step, loss.mean().numpy()))
+
+paddle.save(model.state_dict(), 'model.pdparams')
+
+model = MyNet()
+try:
+    param_dict = paddle.load('model.pdparams')
+    model.load_dict(param_dict)
+except:
+    print('no such pdparams')
+model.eval()
+
+test_dataset=MyDateset('test_A.txt',mode = 'test')
+
+result = []
+for data, name in test_dataset:
+    data = data.reshape([1]+data.shape)
+    pre = model(data)
+    result.append([name,pre.numpy()[0][-1]])
+    # result.append([name,pre.numpy().argmax()])
+
+# 保存结果
+import pandas as pd
+pd.DataFrame(result,columns=['file_name','score']).to_csv('t.csv',index=None)
